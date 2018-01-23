@@ -24,8 +24,10 @@ class ConversionContext(object):
         self.var_to_name_and_shape = {}
         self.literal_to_name_and_array = {}
         self.node_to_var_name = {}
+        self.node_to_inames = {}
         self.assignments = []
         self.subst_rules = []
+        self.cse_names = set()
 
     def variable_to_name(self, node):
         # deals with both Variable and VariableIndex nodes
@@ -68,14 +70,11 @@ class ConversionContext(object):
 
         return iname
 
-    @staticmethod
-    def _is_cse_eligible(node):
-        return not (
-            (isinstance(node, g.Literal) and node.array.shape == ()) or
-
-            not isinstance(node, g.Indexed) or
-
-            not isinstance(node, g.Variable))
+    def _is_cse_eligible(self, node):
+        if (isinstance(node, g.Literal) and node.array.shape == ()):
+            return False
+        else:
+            return not isinstance(node, (g.FlexiblyIndexed, g.Indexed))
 
     def rec_gem(self, node, parent):
         if (
@@ -83,15 +82,24 @@ class ConversionContext(object):
                 self._is_cse_eligible(node)):
             try:
                 var_name = self.node_to_var_name[node]
+                free_inames = self.node_to_inames[node]
             except KeyError:
                 result = expr_to_loopy(node, self)
                 var_name = self.name_gen("cse")
+                self.cse_names.add(var_name)
                 self.node_to_var_name[node] = var_name
                 free_inames = tuple(
                     self.index_to_iname(i) for i in node.free_indices)
+                self.node_to_inames[node] = node.free_indices
+
                 self.assignments.append((var_name, free_inames, result))
 
-            return p.Variable(var_name)
+            if len(free_inames) == 0:
+                return p.Variable(var_name)
+            else:
+                return p.Subscript(p.Variable(var_name),
+                                   tuple(index_to_loopy(i, self) for i in
+                                         self.node_to_inames[node]))
 
         else:
             return expr_to_loopy(node, self)
@@ -245,6 +253,12 @@ def map_flexibly_indexed(node, ctx):
 
         return result
 
+    if c.shape == (None, ):
+        # This is the case when the the variable is a constant in the form.
+        # The tsfc kernel gives it as a FlexiblyIndexedVariable with shape
+        # `(None,)`.
+        return p.Variable(index_aggregate_to_name(c, ctx))
+
     return p.Subscript(
         p.Variable(index_aggregate_to_name(c, ctx)),
         tuple(flex_idx_to_loopy(i) for i in node.dim2idxs))
@@ -309,8 +323,8 @@ def get_empty_assumptions_domain(domain):
 
 # {{{ main entrypoint
 
-def tsfc_to_loopy(ir, argument_ordering, kernel_name="tsfc_kernel", generate_increments=False):
-
+def tsfc_to_loopy(ir, argument_ordering, kernel_name="tsfc_kernel",
+                  generate_increments=False, in_place_cse_dupl=False):
     new_argument_ordering = []
     for idx in argument_ordering:
         if idx not in new_argument_ordering:
@@ -345,7 +359,8 @@ def tsfc_to_loopy(ir, argument_ordering, kernel_name="tsfc_kernel", generate_inc
             subscr(var_name, free_indices),
             rhs,
             forced_iname_deps=frozenset(free_indices),
-            forced_iname_deps_is_final=True)
+            forced_iname_deps_is_final=True,
+            tags=frozenset(['cse']))
         for var_name, free_indices, rhs in ctx.assignments]
 
     # }}}
@@ -360,22 +375,23 @@ def tsfc_to_loopy(ir, argument_ordering, kernel_name="tsfc_kernel", generate_inc
 
         assert isinstance(lhs_expr, p.Subscript)
         from pymbolic.mapper.dependency import DependencyMapper
-        iname_dep, = DependencyMapper(composite_leaves=False)(lhs_expr.index_tuple)
+        iname_deps = list(DependencyMapper(composite_leaves=False)(lhs_expr.index_tuple))
 
-        assert isinstance(iname_dep, p.Variable)
+        for iname_dep in iname_deps:
+            assert isinstance(iname_dep, p.Variable)
 
-        lhs_expr_single = p.Variable(ctx.name_gen(lhs_expr.aggregate.name))[iname_dep]
+            lhs_expr_single = p.Variable(ctx.name_gen(lhs_expr.aggregate.name))[iname_dep]
 
-        if generate_increments:
-            assignment_rhs = lhs_expr + rhs
-        else:
-            assignment_rhs = rhs
+            if generate_increments:
+                assignment_rhs = lhs_expr + rhs
+            else:
+                assignment_rhs = rhs
 
-        instructions.append(lp.Assignment(
-            lhs_expr_single,
-            assignment_rhs,
-            forced_iname_deps=frozenset(free_indices),
-            forced_iname_deps_is_final=True))
+            instructions.append(lp.Assignment(
+                lhs_expr_single,
+                assignment_rhs,
+                forced_iname_deps=frozenset(free_indices),
+                forced_iname_deps_is_final=True))
 
     # }}}
 
@@ -416,18 +432,32 @@ def tsfc_to_loopy(ir, argument_ordering, kernel_name="tsfc_kernel", generate_inc
 
     # }}}
 
-    data = [
+    global_temps = [
         lp.TemporaryVariable(
             name, shape=lp.auto, initializer=val,
             scope=lp.temp_var_scope.GLOBAL,
             read_only=True)
-        for name, val in six.itervalues(ctx.literal_to_name_and_array)] + ["..."]
+        for name, val in six.itervalues(ctx.literal_to_name_and_array)]
+    cse_temps = [
+        lp.TemporaryVariable(
+            name, dtype=np.float64, shape=lp.auto, base_indices=lp.auto,
+            scope=lp.temp_var_scope.PRIVATE) for name in ctx.cse_names]
+    data = global_temps + cse_temps + ["..."]
 
     knl = lp.make_kernel(
         [domain],
         instructions + ctx.subst_rules,
         data,
         name=kernel_name)
+
+    # FIXME: Dealing with the Island problem
+    # Commenting(and not deleting) it as it maybe used for temporary
+    # compilation. A long term solution is in process
+    if in_place_cse_dupl:
+        for insn_id, cse_assignment in enumerate(ctx.assignments):
+            var_name, free_indices, _ = cse_assignment
+            for iname in free_indices:
+                knl = lp.duplicate_inames(knl, iname, "writes:"+var_name)
 
     return knl
 
